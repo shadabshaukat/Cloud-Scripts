@@ -1,0 +1,725 @@
+a) database size
+
+select
+'===========================================================' || chr(10) ||
+'Total Physical Size = ' || round(redolog_size_gb+dbfiles_size_gb+tempfiles_size_gb+archlog_size_gb+ctlfiles_size_gb,2) || ' GB' || chr(10) ||
+'===========================================================' || chr(10) ||
+' Redo Logs Size : ' || round(redolog_size_gb,3) || ' GB' || chr(10) ||
+' Data Files Size : ' || round(dbfiles_size_gb,3) || ' GB' || chr(10) ||
+' Temp Files Size : ' || round(tempfiles_size_gb,3) || ' GB' || chr(10) ||
+' Archive Log Size : ' || round(archlog_size_gb,3) || ' GB' || chr(10) ||
+' Control Files Size : ' || round(ctlfiles_size_gb,3) || ' GB' || chr(10) ||
+'===========================================================' || chr(10) ||
+'Actual Database Size = ' || db_size_gb || ' GB' || chr(10) ||
+'===========================================================' || chr(10) ||
+' Used Database Size : ' || used_db_size_gb || ' GB' || chr(10) ||
+' Free Database Size : ' || free_db_size_gb || ' GB' as summary
+from (
+select sys_context('USERENV', 'DB_NAME') db_name
+,(select sum(bytes)/1024/1024/1024 redo_size from v$log ) redolog_size_gb
+,(select sum(bytes)/1024/1024/1024 data_size from dba_data_files ) dbfiles_size_gb
+,(select nvl(sum(bytes),0)/1024/1024/1024 temp_size from dba_temp_files ) tempfiles_size_gb
+,(select sum(bytes)/1024/1024/1024 from v$log where sequence# in (select sequence# from v$loghist)) archlog_size_gb
+,(select sum(block_size*file_size_blks)/1024/1024/1024 controlfile_size from v$controlfile) ctlfiles_size_gb
+,round(sum(used.bytes)/1024/1024/1024,3) db_size_gb
+,round(sum(used.bytes)/1024/1024/1024,3) - round(free.f/1024 /1024/ 1024) used_db_size_gb
+,round(free.f/1024/1024/1024,3) free_db_size_gb
+from (select bytes from v$datafile
+union all
+select bytes from v$tempfile) used
+,(select sum(bytes) as f from dba_free_space) free
+group by free.f);
+
+Note: archlog_size is not for physical archived log size,it's just saying the archived log size for those in redo log with 'YES' in ARC column, the actual physical archive log file size depends on your retention hours setting below
+
+SQL> set serveroutput on
+SQL> exec rdsadmin.rdsadmin_util.show_configuration;
+NAME:archivelog retention hours
+VALUE:24
+DESCRIPTION:ArchiveLog expiration specifies the duration in hours before archive/redo log files are automatically deleted.
+NAME:tracefile retention
+VALUE:10080
+DESCRIPTION:tracefile expiration specifies the duration in minutes before tracefiles in bdump are automatically deleted.
+
+select * from table(RDSADMIN.RDS_FILE_UTIL.LISTDIR('DATA_PUMP_DIR'));
+
+note: filesize in rds_file_util.listdir is in bytes.
+
+http://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/USER_LogAccess.Concepts.Oracle.html
+
+SQL> alter session set NLS_DATE_FORMAT='YYYY-MM-DD HH24:MI:SS';
+
+Session altered.
+
+SQL> select filename, type, (filesize/1024/1024) filesize, mtime from table(RDSADMIN.RDS_FILE_UTIL.LISTDIR('DATA_PUMP_DIR')) order by 1;
+
+FILENAME                                                                                         TYPE          FILESIZE MTIME
+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- ---------- ---------- -------------------
+11gexp101.dmp                                                                                         file         30.390625 2015-11-02 16:08:47
+11gexp102.dmp                                                                                         file             0 2015-11-02 16:08:51
+11gexp201.dmp                                                                                         file        25.2226563 2015-11-02 16:09:02
+3 rows selected.
+
+Scenario 0: check what's running on database
+
+SELECT username, seconds_in_wait, machine, port, terminal, program, module, service_name FROM v$session where Status='ACTIVE' AND UserName IS NOT NULL;
+
+ 
+
+Scenario 1: Resource Intensive SQL Statements, CPU or Disk
+
+"100% CPU alone not an indication of a problem and can indicate an optimal state"
+
+All virtual memory servers are designed to drive CPU to 100% as soon as possible.
+
+This just means that the CPUs are working to their full potential. The only metric that identifies a CPU bottleneck is when the run queue (r value) exceeds the number of CPUs on the server.
+
+# show cpu usage for active sessions
+
+SET PAUSE ON
+SET PAUSE 'Press Return to Continue'
+SET PAGESIZE 60
+SET LINESIZE 300
+
+COLUMN username FORMAT A30
+COLUMN sid FORMAT 999,999,999
+COLUMN serial# FORMAT 999,999,999
+COLUMN "cpu usage (seconds)"  FORMAT 999,999,999.0000
+
+SELECT
+  s.username,
+  t.sid,
+  s.serial#,
+  SUM(VALUE/100) as "cpu usage (seconds)"
+FROM
+  v$session s,
+  v$sesstat t,
+  v$statname n
+WHERE
+  t.STATISTIC# = n.STATISTIC#
+AND
+  NAME like '%CPU used by this session%'
+AND
+  t.SID = s.SID
+AND
+  s.status='ACTIVE'
+AND
+  s.username is not null
+GROUP BY username,t.sid,s.serial#
+/
+
+# monitor the near real-time resource consumption of SQL queries sorted by cpu_time
+
+select * from (
+select
+a.sid session_id
+,a.sql_id
+,a.status
+,a.cpu_time/1000000 cpu_sec
+,a.buffer_gets
+,a.disk_reads
+,b.sql_text sql_text
+from v$sql_monitor a
+,v$sql b
+where a.sql_id = b.sql_id
+order by a.cpu_time desc)
+where rownum <=20;
+
+# same as above, you can monitor currently executing queries ordered by the number of disk reads
+
+select * from (
+select
+a.sid session_id
+,a.sql_id
+,a.status
+,a.cpu_time/1000000 cpu_sec
+,a.buffer_gets
+,a.disk_reads
+,substr(b.sql_text,1,15) sql_text
+from v$sql_monitor a
+,v$sql b
+where a.sql_id = b.sql_id
+and
+a.status='EXECUTING'
+order by a.disk_reads desc)
+where rownum <=20;
+
+Note: V$SQL_MONITOR view is only available with Oracle Database 11g or higher.
+
+# find the worst queries
+
+select b.username username, a.disk_reads reads, a.executions exec, a.disk_reads /decode (a.executions, 0, 1, a.executions) rds_exec_ratio, a.sql_text Statement from v$sqlarea a, dba_users b where a.parsing_user_id = b.user_id and a.disk_reads > 100000 order by a.disk_reads desc;
+
+Note: the disk_reads columns can be replaced with the buffer_gets column to provide information on SQL statements requiring the largest amount of memory.
+
+# find the worse queries 2
+
+select snap_id, disk_reads_delta reads_delta, executions_delta exec_delta, disk_reads_delta /decode (executions_delta, 0, 1,executions_delta) rds_exec_ratio, sql_id from dba_hist_sqlstat where disk_reads_delta > 10000 order by dsik_reads_delta desc;
+
+SNAP_ID READS_DELTA EXEC_DELTA RDS_EXEC_RATIO SQL_ID
+---------- ----------- ---------- -------------- -------------
+      1937    106907        1      106907 b6usrg82hwsa3
+      1913     67833        1       67833 b6usrg82hwsa3
+      1889     54370        1       54370 b6usrg82hwsa3
+
+# get query text
+
+SQL> select command_type,sql_text from dba_hist_sqltext where sql_id = 'b6usrg82hwsa3';
+
+COMMAND_TYPE
+------------
+SQL_TEXT
+--------------------------------------------------------------------------------
+     170
+call dbms_stats.gather_database_stats_job_proc (  )
+
+# get explain for the query
+
+SQL> select * from table(dbms_xplan.display_awr('66a40jcr7a4u3'));
+
+# the top 10 CPU intensive queries
+select *
+from (select a.username, b.sid, a.serial#, a.osuser, a.program, a.sql_id, a.state, value/100 cpu_usage_sec , a.event
+from v$session a
+,v$sesstat b
+,v$statname c
+where b.statistic# = c.statistic#
+and name like '%CPU used by this session%'
+and b.sid = a.sid
+order by value desc)
+where rownum <=10;
+
+# To aggregate above output
+select username, osuser, module, sum(cpu_usage_sec) cpu_usage_sec
+from (select a.username, b.sid, a.osuser, a.program, a.sql_id, a.state, value/100 cpu_usage_sec, a.event, a.module
+from v$session a
+,v$sesstat b
+,v$statname c
+where b.statistic# = c.statistic#
+and name like '%CPU used by this session%'
+and b.sid = a.sid)
+group by username, osuser, module
+order by cpu_usage_sec desc;
+
+#you can display CPU for any Oracle user session with this script
+select
+   ss.username,
+   se.SID,
+   VALUE/100 cpu_usage_seconds
+from
+   v$session ss,
+   v$sesstat se,
+   v$statname sn
+where
+   se.STATISTIC# = sn.STATISTIC#
+and
+   NAME like '%CPU used by this session%'
+and
+   se.SID = ss.SID
+and
+   ss.status='ACTIVE'
+and
+   ss.username is not null
+ order by VALUE desc;
+
+USERNAME                  SID CPU_USAGE_SECONDS
+------------------------------ ---------- -----------------
+SYSMAN                       64          20.17
+DBSNMP                       59           3.92
+AWS                       43        .16
+
+Scenario 2: Long Running Queries and Open Transactions
+
+# Check Open Transactions, login as sys or system from sqlplus
+
+select * from gv$transaction;
+
+# in past 1 day, run time more than 2000s
+
+set wrap off
+
+col elapsed_time_delta format 9999999999
+
+col plan_hash_value    format 9999999999
+
+col seconds            format 99999
+
+col executions_total   format 99999999
+
+
+select 
+
+   stat.sql_id, 	
+
+   plan_hash_value, 
+
+   rpad(parsing_schema_name,10) "schema",elapsed_time_total/1000000 "seconds",  	
+
+   elapsed_time_delta,disk_reads_delta,
+
+   stat.executions_total,
+
+   to_char(ss.end_interval_time,'dd-mm-yy hh24:mi:ss') "endtime",  
+
+   rpad(sql_text,140) text,ss.snap_id
+
+from 
+
+   dba_hist_sqlstat  stat, 
+
+   dba_hist_sqltext  txt, 
+
+   dba_hist_snapshot ss
+
+
+where 
+
+   stat.sql_id = txt.sql_id 
+
+and 
+
+   stat.dbid = txt.dbid 
+
+   
+
+and 
+
+   ss.dbid = stat.dbid 
+
+and 
+
+   ss.instance_number = stat.instance_number 
+
+and 
+
+   stat.snap_id = ss.snap_id 
+
+and 
+
+   parsing_schema_name not like 'sys%'  
+
+and 
+
+   ss.begin_interval_time >= sysdate-1
+
+and 
+
+   stat.elapsed_time_total/1000000 > 2000
+
+order by 
+
+   elapsed_time_total desc;
+
+
+# Finding long operations (e.g. full table scans). If it is because of lots of short operations, nothing will show up.
+
+COLUMN percent FORMAT 999.99
+
+SELECT sid, to_char(start_time,'hh24:mi:ss') stime,
+message,( sofar/totalwork)* 100 percent
+FROM v$session_longops
+WHERE sofar/totalwork < 1
+/
+
+# long query , run more than 60s, active, not background type.
+select s.username,s.type,s.sid,s.serial#,s.last_call_et seconds_running,q.sql_text from v$session s
+join v$sql q
+on s.sql_id = q.sql_id
+ where status='ACTIVE'
+ and type <> 'BACKGROUND'
+ and last_call_et> 60
+order by sid,serial#;
+
+---------------
+# Queries currently running for more than 60 seconds. Note that it prints multiple lines per running query if the SQL has multiple lines.
+
+select s.username,s.sid,s.serial#,s.last_call_et/60 mins_running,q.sql_text from v$session s
+join v$sqltext_with_newlines q
+on s.sql_address = q.address
+ where status='ACTIVE'
+and type <>'BACKGROUND'
+and last_call_et> 60
+order by sid,serial#,q.piece
+
+# logon within last 4 hours, still active within last half hour
+
+SELECT s.sid, s.serial#, p.spid as "OS PID", s.username, s.module, st.value/100 as "DB Time (sec)"
+, stcpu.value/100 as "CPU Time (sec)", round(stcpu.value / st.value * 100,2) as "% CPU"
+FROM v$sesstat st, v$statname sn, v$session s, v$sesstat stcpu, v$statname sncpu, v$process p
+WHERE sn.name = 'DB time' -- CPU
+AND st.statistic# = sn.statistic#
+AND st.sid = s.sid
+AND  sncpu.name = 'CPU used by this session' -- CPU
+AND stcpu.statistic# = sncpu.statistic#
+AND stcpu.sid = st.sid
+AND s.paddr = p.addr
+AND s.last_call_et < 1800 -- active within last 1/2 hour
+AND s.logon_time > (SYSDATE - 240/1440) -- sessions logged on within 4 hours
+AND st.value/100 > 30 order by st.value;
+
+# ordered by time_waited for sessions logon within last 4 hours, and still active within last half an hour, and event is db file sequential read.
+
+SELECT s.sid, s.serial#, p.spid as "OS PID", s.username, s.module, se.time_waited
+FROM v$session_event se, v$session s, v$process p
+WHERE se.event = 'db file sequential read'
+AND s.last_call_et < 1800 -- active within last 1/2 hour
+AND s.logon_time > (SYSDATE - 240/1440) -- sessions logged on within 4 hours
+AND se.sid = s.sid
+AND s.paddr = p.addr
+ORDER BY se.time_waited;
+ 
+
+Scenario 3:  Locking Sessions
+
+# check which statement is blocking others
+
+select s1.username blkg_user, s1.machine blkg_machine,s1.sid blkg_sid, s1.serial# blkg_serialnum,s1.process blkg_OS_PID,substr(b1.sql_text,1,50) blkg_sql,chr(10),s2.username
+wait_user, s2.machine wait_machine,s2.sid wait_sid, s2.serial# wait_serialnum ,s2.process wait_OS_PID ,substr(w1.sql_text,1,50) wait_sql,lo.object_id blkd_obj_id,do.owner obj_own, do.object_name obj_name from v$lock l1,v$session s1,v$lock l2,v$session s2 ,v$locked_object lo,v$sqlarea b1,v$sqlarea w1,dba_objects do
+where s1.sid = l1.sid and s2.sid = l2.sid and l1.id1 = l2.id1 and s1.sid = lo.session_id and lo.object_id = do.object_id
+and l1.block = 1 and s1.prev_sql_addr = b1.address and s2.sql_address = w1.address and l2.request > 0;
+
+ 
+
+# This shows locks. Sometimes things are going slow as it is blocked waiting for a lock:
+
+select process,sid, blocking_session from v$session where blocking_session is not null;
+
+or
+
+select object_name,  object_type,  session_id,  type,   lmode,  request,  block,  ctime  from v$locked_object, all_objects, v$lock
+where v$locked_object.object_id = all_objects.object_id AND  v$lock.id1 = all_objects.object_id AND  v$lock.sid = v$locked_object.session_id order by  session_id, ctime desc, object_name;
+
+or
+
+SELECT B.Owner, B.Object_Name, A.Oracle_Username, A.OS_User_Name FROM V$Locked_Object A, All_Objects B WHERE A.Object_ID = B.Object_ID;
+
+Scenario 4:  Detecting undo block changes
+
+• ORA-01555: snapshot too old
+• ORA-30036: unable to extend segment by ... in undo tablespace 'UNDOTBS1'
+
+# Run the query multiple times and examine the delta between each occurrence of BLOCK_CHANGES. Large deltas indicate high redo generation by the session
+
+SELECT s.sid, s.serial#, s.username, s.program,
+ i.block_changes
+  FROM v$session s, v$sess_io i
+  WHERE s.sid = i.sid and block_changes > 1000
+  ORDER BY 5 desc;
+
+Note: this view v$sess_io contains the column BLOCK_CHANGES which indicates how much blocks have been changed by the session. High values indicate a session generating lots of redo.
+
+SELECT s.sid, s.serial#, s.username, s.program,
+ t.used_ublk, t.used_urec
+FROM v$session s, v$transaction t
+ WHERE s.taddr = t.addr
+  ORDER BY 5 desc;
+
+Note: V$TRANSACTION. This view contains information about the amount of undo blocks and undo records accessed by the transaction (as found in the USED_UBLK and USED_UREC columns).
+
+#If you want to view the SQL statement associated with a user consuming undo space, then join to V$SQL as shown below
+ 
+select s.sid, s.serial#, s.osuser, s.logon_time, s.status
+,s.machine, t.used_ublk
+,t.used_ublk*16384/1024/1024 undo_usage_mb
+,q.sql_text
+from v$session
+s
+,v$transaction t
+,v$sql q
+where t.addr = s.taddr
+and s.sql_id = q.sql_id;
+
+# To identify which users are consuming space in the undo tablespace. Run this query to report on basic information regarding space allocated on a per user basis, including sql statement associated with the user
+
+
+select
+s.sid
+,s.serial#
+,s.osuser
+,s.logon_time
+,s.status
+,s.machine
+,t.used_ublk
+,t.used_ublk*16384/1024/1024 undo_usage_mb
+,q.sql_text
+from v$session
+s
+,v$transaction t
+,v$sql
+q
+where t.addr = s.taddr
+and s.sql_id = q.sql_id;
+
+# pinpoint which users are responsible for space allocated within the undo tablespace
+
+select
+s.sid
+,s.serial#
+,s.username
+,s.program
+,r.name undo_name
+,rs.status
+,rs.rssize/1024/1024 redo_size_mb
+,rs.extents
+from v$session
+s
+,v$transaction t
+,v$rollname
+r
+,v$rollstat
+rs
+where s.taddr = t.addr
+and t.xidusn = r.usn
+and r.usn
+= rs.usn;
+
+# The query checks for issues with the undo tablespace that have occurred within the last day
+
+select
+to_char(begin_time,'MM-DD-YYYY HH24:MI') begin_time
+,ssolderrcnt
+ORA_01555_cnt    -- number of times got snapshot too old error
+,nospaceerrcnt no_space_cnt  -- number of times space was requested in the undo tablespace
+but none was to be found. If the NO_SPACE_CNT is reporting a non-zero value, you may need to add more
+space to your undo tablespace.
+,txncount
+max_num_txns
+,maxquerylen
+max_query_len
+,expiredblks
+blck_in_expired
+from v$undostat
+where begin_time > sysdate - 1
+order by begin_time;
+
+Scenario 5: Checking Memory Usage
+
+# a quick check of PGA and UGA memory grouping by Session Status, can tell you how much memory is being used by INACTIVE sessions
+
+select status, round(total_user_mem/1024,2) mem_used_in_kb, round(100 * total_user_mem/total_mem,2) mem_percent
+from (select b.status, sum(value) total_user_mem
+       from sys.v_$statname c
+               ,sys.v_$sesstat a
+                   ,sys.v_$session b
+                   ,sys.v_$bgprocess p
+      where a.statistic#=c.statistic#
+            and p.paddr (+) = b.paddr
+                and b.sid=a.sid
+                and c.name in ('session pga memory','session uga memory')
+      group by b.status)
+   ,(select sum(value) total_mem
+      from sys.v_$statname c
+              ,sys.v_$sesstat a
+     where a.statistic#=c.statistic#
+           and c.name in ('session pga memory','session uga memory'))
+order by 3 desc;
+
+# Connections count - dedicated server or active sessions
+
+SELECT server, count(*) FROM v$session group by server;
+
+SELECT status, count(*) FROM v$session group by status;
+
+# Dynamic memory usage
+SELECT component , current_size, user_specified_size FROM V$MEMORY_DYNAMIC_COMPONENTS WHERE current_size > 0;
+
+Scenario 6: Open Cursors Monitoring
+
+ORA-01000: maximum open cursors exceeded
+
+# check the number of open cursors each session has opened, list the first 20 results
+
+select * from (
+select
+a.value
+,c.username
+,c.machine
+,c.sid
+,c.serial#
+from v$sesstat a
+,v$statname b
+,v$session c
+where a.statistic# = b.statistic#
+and
+c.sid
+= a.sid
+and
+b.name
+= 'opened cursors current'
+and
+a.value
+!= 0
+and
+c.username IS NOT NULL
+order by 1 desc,2)
+where rownum < 21;
+
+Note: check 'show parameter open_cursors;' to show open_cursors settings, if a session is using like 1000 cursors, probably it's due to application code not closing open cursors
+
+Scenario 7: Check SQL that Consuming Temporary Space
+
+# to view the space a session is using in the temporary tablespace
+
+SELECT
+s.sid
+,s.serial#
+,s.username
+,p.spid
+,s.module
+,p.program
+,SUM(su.blocks) * tbsp.block_size/1024/1024 mb_used
+,su.tablespace
+FROM v$sort_usage
+su
+,v$session
+s
+,dba_tablespaces tbsp
+,v$process
+p
+WHERE su.session_addr = s.saddr
+AND
+su.tablespace
+= tbsp.tablespace_name
+AND
+s.paddr
+= p.addr
+GROUP BY
+s.sid, s.serial#, s.username, s.osuser, p.spid, s.module,
+p.program, tbsp.block_size, su.tablespace
+ORDER BY s.sid;
+
+
+# ORA-1652: unable to extend temp segment by 128 in tablespace
+
+make sure it's auto grow and no maximum size limit for temp files
+
+0) select * from v$tempfile   # check initial creation size and file path etc
+
+1) select * from dba_temp_free_space;
+2) select autoextensible from dba_temp_files;
+3) select file_name,maxbytes/1024/1024/1024 GB from dba_temp_files;  # by default, maxbytes should be 32TB.
+
+SQL> select file_name,maxbytes/1024/1024/1024 GB from dba_temp_files;
+
+FILE_NAME                                                                          MAXBYTES/1024/1024/1024
+/rdsdbdata/db/ORCL_A/datafile/o1_mf_temp02_btrglkq4_.tmp                                                       10
+/rdsdbdata/db/ORCL_A/datafile/o1_mf_temp03_bywq42rz_.tmp                                                    32768
+
+4) SQL> create temporary tablespace temp08 tempfile size 180m autoextend on next 20m maxsize 500m;
+
+Tablespace created 
+
+SQL> set head on
+SQL> select * from dba_temp_files where tablespace_name='TEMP08'
+
+FILE_NAME                                                                                             FILE_ID TABLESPACE_NAME             BYTES       BLOCKS STATUS  RELATIVE_FNO AUT   MAXBYTES  MAXBLOCKS INCREMENT_BY USER_BYTES USER_BLOCKS
+/rdsdbdata/db/ORCL_A/datafile/o1_mf_temp08_byxhhbt2_.tmp                                                                   7 TEMP08                 188743680        23040 ONLINE      1024 YES  524288000       64000     2560  187695104       22912
+
+# note:  increment_by : 2560 blocks * 8k/block= 20480k = 20m, 180m is physical OS file size
+
+Scenario 8: AWR/ADDM/ASH/Statspack
+
+If your RDS Oracle instance is Enterprise Edition, you can use AWR/ADDM/ASH, othewise, you can enable option group statspack.
+
+# How to run AWR/ADDM/ASH for your RDS Oracle EE
+
+There are 3 options to run AWR/ADDM/ASH:
+
+    If you have installed Oracle full cleint on your EC2 instance, you can run them after using sqlplus to connect to RDS Oracle instance as follows
+
+SQL> @?/rdbms/admin/awrrpt
+
+# check history snapshots for AWR
+select snap_id, DBID,INSTANCE_NUMBER,BEGIN_INTERVAL_TIME, END_INTERVAL_TIME from dba_hist_snapshot order by snap_id;
+
+SQL> @?/rdbms/admin/addmrpt
+
+SQL> @?/rdbms/admin/ashrpt
+
+    using SQL Developer DBA tool as shown below as screenshot
+
+     Using OEM Web GUI if OEM is enabled
+     Using Statspack - https://megamind.amazon.com/node/3844
+
+Create, View and Delete Snapshots
+
+sqlplus perfstat/perfstat
+SQL> exec statspack.snap;
+SQL> select name,snap_id,to_char(snap_time,'DD.MM.YYYY:HH24:MI:SS') "Date/Time" from stats$snapshot,v$database;
+
+SQL> @?/rdbms/admin/spreport.sql
+
+ 
+
+http://www.akadia.com/services/ora_statspack_survival_guide.html
+
+ 
+Scenario 9: check if the redo log file size is too small
+
+set lines 120; 
+
+set pages 999; 
+
+SELECT 
+
+to_char(first_time,'YYYY-MON-DD') day,
+
+to_char(sum(decode(to_char(first_time,'HH24'),'00',1,0)),'99') "00",
+
+to_char(sum(decode(to_char(first_time,'HH24'),'01',1,0)),'99') "01",
+
+to_char(sum(decode(to_char(first_time,'HH24'),'02',1,0)),'99') "02",
+
+to_char(sum(decode(to_char(first_time,'HH24'),'03',1,0)),'99') "03",
+
+to_char(sum(decode(to_char(first_time,'HH24'),'04',1,0)),'99') "04",
+
+to_char(sum(decode(to_char(first_time,'HH24'),'05',1,0)),'99') "05",
+
+to_char(sum(decode(to_char(first_time,'HH24'),'06',1,0)),'99') "06",
+
+to_char(sum(decode(to_char(first_time,'HH24'),'07',1,0)),'99') "07",
+
+to_char(sum(decode(to_char(first_time,'HH24'),'08',1,0)),'99') "08",
+
+to_char(sum(decode(to_char(first_time,'HH24'),'09',1,0)),'99') "09",
+
+to_char(sum(decode(to_char(first_time,'HH24'),'10',1,0)),'99') "10",
+
+to_char(sum(decode(to_char(first_time,'HH24'),'11',1,0)),'99') "11",
+
+to_char(sum(decode(to_char(first_time,'HH24'),'12',1,0)),'99') "12",
+
+to_char(sum(decode(to_char(first_time,'HH24'),'13',1,0)),'99') "13",
+
+to_char(sum(decode(to_char(first_time,'HH24'),'14',1,0)),'99') "14",
+
+to_char(sum(decode(to_char(first_time,'HH24'),'15',1,0)),'99') "15",
+
+to_char(sum(decode(to_char(first_time,'HH24'),'16',1,0)),'99') "16",
+
+to_char(sum(decode(to_char(first_time,'HH24'),'17',1,0)),'99') "17",
+
+to_char(sum(decode(to_char(first_time,'HH24'),'18',1,0)),'99') "18",
+
+to_char(sum(decode(to_char(first_time,'HH24'),'19',1,0)),'99') "19",
+
+to_char(sum(decode(to_char(first_time,'HH24'),'20',1,0)),'99') "20",
+
+to_char(sum(decode(to_char(first_time,'HH24'),'21',1,0)),'99') "21",
+
+to_char(sum(decode(to_char(first_time,'HH24'),'22',1,0)),'99') "22",
+
+to_char(sum(decode(to_char(first_time,'HH24'),'23',1,0)),'99') "23"
+
+from
+
+   v$log_history
+
+GROUP by 
+
+   to_char(first_time,'YYYY-MON-DD')
+
+order by 
+
+   to_char(first_time,'YYYY-MON-DD');
