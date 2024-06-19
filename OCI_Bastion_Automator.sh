@@ -11,6 +11,7 @@ oci setup repair-file-permissions --file $PRIVATE_KEY_FILE
 
 SESSION_ID=$(oci bastion session create-managed-ssh \
     --bastion-id $BASTION_ID \
+    --session-ttl 10800 \
     --profile $PROFILE \
     --target-port 22 \
     --target-resource-id $TARGET_RESOURCE_ID \
