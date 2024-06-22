@@ -23,7 +23,7 @@ echo "Created session with ID: $SESSION_ID"
 
 echo "Waiting for session to be active..."
 until [ "$(oci bastion session get --session-id $SESSION_ID --profile $PROFILE --query 'data."lifecycle-state"' --raw-output)" == "ACTIVE" ]; do
-    sleep 5
+    sleep 2
 done
 
 echo "Session is active!"
@@ -32,7 +32,11 @@ SSH_COMMAND=$(oci bastion session get --session-id $SESSION_ID --profile $PROFIL
 
 SSH_COMMAND=$(echo "$SSH_COMMAND" | sed "s|<privateKey>|$PRIVATE_KEY_FILE|g")
 
-echo "Final SSH command: $SSH_COMMAND"
+echo "################################################################"
+echo ""
+echo "$SSH_COMMAND"
+echo ""
+echo "################################################################"
 
 echo "Connecting via SSH..."
 eval $SSH_COMMAND
