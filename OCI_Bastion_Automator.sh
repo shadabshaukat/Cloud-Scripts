@@ -23,7 +23,7 @@ echo "Created session with ID: $SESSION_ID"
 
 echo "Waiting for session to be active..."
 until [ "$(oci bastion session get --session-id $SESSION_ID --profile $PROFILE --query 'data."lifecycle-state"' --raw-output)" == "ACTIVE" ]; do
-    sleep 2
+    sleep 3
 done
 
 echo "Session is active!"
