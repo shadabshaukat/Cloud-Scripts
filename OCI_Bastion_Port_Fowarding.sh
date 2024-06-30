@@ -10,7 +10,6 @@ PRIVATE_KEY_FILE="/Users/shadab/Downloads/mydemo_vcn.priv"
 PROFILE="EEOCI"
 
 oci setup repair-file-permissions --file $PRIVATE_KEY_FILE
-chmod 600 $PRIVATE_KEY_FILE
 
 SESSION_ID=$(oci bastion session create-port-forwarding \
     --bastion-id $BASTION_ID \
@@ -50,5 +49,6 @@ echo "Adding private key to SSH agent..."
 eval "$(ssh-agent -s)"
 ssh-add $PRIVATE_KEY_FILE
 
-echo "Opening SSH Tunnel via OCI Bastion Service for $TARGET_PRIVATE_IP:$TARGET_PORT..."
-eval "$SSH_COMMAND -v"
+echo "Port-Forwarding Tunnel Command for OCI Bastion Service for $TARGET_PRIVATE_IP:$TARGET_PORT..."
+echo ""
+echo "Copy and Paste Command in New Terminal Window"
